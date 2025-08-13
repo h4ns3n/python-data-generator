@@ -1,0 +1,8 @@
+{
+  "PSQLDS1": {
+    "url": "jdbc:postgresql://localhost:5432/mydb",
+    "username": "myuser",
+    "password": "mypassword",
+    "ssl": false
+  }
+}

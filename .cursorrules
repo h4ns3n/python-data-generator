@@ -1,0 +1,123 @@
+Project: Python Postgres Data Generator
+
+Goal
+- Provide clear guardrails for maintaining and extending a small Python utility that generates sample transaction data in Postgres and verifies connectivity.
+
+Tech stack and runtime
+- Python 3.x (CLI scripts)
+- Postgres via psycopg2 (including execute_values for batch inserts)
+- Optional: tqdm for progress bars
+
+Key files
+- simulate_data.py: Main data generator. Creates/reset tables, inserts data sequentially or concurrently, and can simulate continuous production traffic.
+- test_connection.py: Simple connectivity check that prints the Postgres version.
+- python-datasource.json: JSON config containing JDBC-style URL and credentials for a named alias.
+
+Configuration model
+- JSON schema per alias:
+  {
+    "PSQLDS1": {
+      "url": "jdbc:postgresql://host:port/dbname",
+      "username": "...",
+      "password": "...",
+      "ssl": true|false
+    }
+  }
+- parse_jdbc_url converts JDBC URL → psycopg2 params {host, port, dbname}.
+- ssl handling: map ssl true → sslmode=require; false/omitted → sslmode=disable.
+- Prefer placing configs at repo root as "python-datasource.json" for consistency across scripts.
+
+Database schema and operations
+- Table pattern: transactions_{n}
+  - id SERIAL PRIMARY KEY
+  - transaction_ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  - amount NUMERIC(10,2) NOT NULL
+  - description TEXT
+- Table lifecycle helpers:
+  - create_table_if_not_exists(conn, table_name)
+  - reset_table(conn, table_name) → DROP then re-create
+
+Data generation and insertion
+- Record fields:
+  - amount: random float in [1.00, 1000.00], rounded to 2 decimals
+  - description: random 10-char alphanumeric
+- Batch inserts use psycopg2.extras.execute_values for performance.
+- Commit once per batch; on errors, rollback and surface the exception (concurrent path already rolls back and returns connection to the pool).
+- Progress: attempt to import tqdm; if unavailable, proceed without a progress bar.
+
+Concurrency model
+- Two modes:
+  - Sequential: insert_records(conn, table_name, num_records, batch_size)
+  - Concurrent: insert_records_concurrent(db_params, table_name, num_records, batch_size, num_workers)
+- Concurrency uses ThreadPoolExecutor and SimpleConnectionPool(max=num_workers).
+- Batches are generated lazily via generate_batches to avoid large memory spikes.
+
+Simulation mode
+- simulate_production(conn, table_names, batch_size, delay): continuously inserts batches into random tables, sleeping between batches.
+- Intended for exercising downstream pipelines (Ctrl+C to stop).
+
+CLI contracts
+- simulate_data.py flags:
+  - --config: path to JSON config (default should be repo-root "python-datasource.json").
+  - --alias: JSON alias (default "PSQLDS1").
+  - --num_tables: 1..1000.
+  - --start_table: ≥ 1 and ≤ num_tables; tables below start_table are skipped.
+  - --records_per_table: 1000..10000000.
+  - --simulate: enable continuous production mode.
+  - --batch_size: default 10000.
+  - --delay: sleep seconds between simulation batches.
+  - --num_workers: >1 enables concurrent insert path; else sequential.
+  - --reset_all: drop and recreate all processed tables.
+  - --reset_tables: comma-separated table numbers to reset (e.g., "1,3,5").
+- test_connection.py flags:
+  - --config, --alias (same semantics as above).
+
+Security and secrets
+- Do NOT commit real credentials. Treat example configs as placeholders; rotate if any real values were ever committed.
+- Prefer environment variables or secret managers for credentials. If JSON must be used locally, keep it out of version control and add to .gitignore.
+- Never interpolate untrusted inputs into SQL identifiers or queries. Table names here are generated (transactions_{n}); keep it that way.
+
+Style and code conventions
+- Python only; keep scripts simple and readable. Prefer functions with clear responsibilities and docstrings.
+- Naming: descriptive, full words (avoid abbreviations and 1–2 letter names).
+- Control flow: use guard clauses for validation; avoid deep nesting.
+- Error handling: catch exceptions where there is actionable remediation or user-facing messaging; otherwise let them propagate.
+- SQL: use execute_values for batch parameterization; avoid building VALUES tuples manually.
+- Logging: current scripts use print; keep consistency. If adding structured logging, do so across the codebase in one cohesive change.
+- Typing: new/modified functions should add type hints. Do not over-annotate trivial locals.
+- Formatting: multi-line over overly terse one-liners; wrap long lines; avoid unrelated reformatting.
+
+Performance guidance
+- Favor batch_size around 10k unless memory/latency requirements dictate otherwise.
+- Set num_workers to a small integer relative to cores and database limits; pool size should match num_workers.
+- Keep commits per batch to balance durability and throughput. Avoid per-row commits.
+
+Path and consistency notes
+- Unify default config path across scripts to "python-datasource.json" at the repo root.
+- If changing defaults, update README and examples together.
+
+Runbook examples
+- Test connectivity:
+  python3 test_connection.py --config python-datasource.json --alias PSQLDS1
+- Generate data sequentially (single table):
+  python3 simulate_data.py --config python-datasource.json --alias PSQLDS1 --num_tables 1 --records_per_table 10000 --batch_size 5000
+- Generate data concurrently (four workers):
+  python3 simulate_data.py --config python-datasource.json --alias PSQLDS1 --num_tables 4 --records_per_table 200000 --batch_size 10000 --num_workers 4
+- Simulate continuous production:
+  python3 simulate_data.py --config python-datasource.json --alias PSQLDS1 --num_tables 3 --records_per_table 1000 --simulate --batch_size 1000 --delay 1.5
+
+Testing and validation
+- After code changes, verify both:
+  - Connectivity: run test_connection.py.
+  - Insertions: run a small sequential insert and check row counts and schema.
+
+Non-goals
+- ORMs, migrations, and complex schema management are out of scope for this utility.
+- Multi-DB vendor support is not targeted.
+
+Backlog candidates (if you extend the project)
+- Centralize config loading in a shared module; add .env support.
+- Replace print with logging and configurable log levels.
+- Add CLI validation error messages with helpful remediation hints.
+- Add type hints across the codebase and basic unit tests for parse_jdbc_url and config loading.
+- Support custom schemas/columns via templated generators.
