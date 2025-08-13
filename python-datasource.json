@@ -1,9 +1,0 @@
-{
-    "PSQLDS1": {
-      "url": "jdbc:postgresql://mukuru-de-stg-sf-cdc-connector-pg.c5jz3s3uxytw.eu-west-1.rds.amazonaws.com:5432/employees",
-      "username": "sfcdcrootuser",
-      "password": "+VR~w0{fPD5i58F5XIkvxrZ#V#vp",
-      "publication": "agent_postgres_publication",
-      "ssl": true
-    }
-  }

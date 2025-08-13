@@ -8,3 +8,6 @@ __pycache__/
 # Virtual environments
 venv/
 .env/
+
+# Local database config (keep secrets out of VCS)
+python-datasource.json
