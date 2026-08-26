@@ -33,13 +33,19 @@ def test_full_lifecycle_against_real_cluster(conn, tmp_path):
     full teardown so this test leaves no trace on the shared cluster.
     """
     table_name = "transactions_live_test"
-    schema.create_accounts_table(conn)
-    schema.drop_transactions_table(conn, table_name)
-    schema.create_transactions_table(conn, table_name)
-
     changelog = Changelog(str(tmp_path / "live_cl.jsonl"))
     try:
-        schema.seed_accounts(conn, num_accounts=3, changelog=changelog)
+        schema.create_customers_table(conn)
+        schema.seed_customers(conn, num_customers=3, changelog=changelog)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM customers")
+            customer_ids = [row[0] for row in cur.fetchall()]
+
+        schema.create_accounts_table(conn)
+        schema.drop_transactions_table(conn, table_name)
+        schema.create_transactions_table(conn, table_name)
+
+        schema.seed_accounts(conn, num_accounts=3, customer_ids=customer_ids, changelog=changelog)
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM accounts ORDER BY id DESC LIMIT 3")
             account_ids = [row[0] for row in cur.fetchall()]
@@ -68,6 +74,18 @@ def test_full_lifecycle_against_real_cluster(conn, tmp_path):
         schema.drop_transactions_table(conn, table_name)
 
 
+def _customer_ids(conn):
+    """
+    Fetch existing customer ids, relying on test_full_lifecycle_against_real_cluster
+    (which runs first in this module and creates/seeds customers) having already
+    populated the table — the same ordering assumption every test here already
+    makes about the accounts table.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM customers")
+        return [row[0] for row in cur.fetchall()]
+
+
 def _single_row_setup(conn, table_name, changelog):
     """
     Reset a table to exactly one account + one row, so pick_target_id's
@@ -78,7 +96,7 @@ def _single_row_setup(conn, table_name, changelog):
     """
     schema.drop_transactions_table(conn, table_name)
     schema.create_transactions_table(conn, table_name)
-    schema.seed_accounts(conn, num_accounts=1, changelog=changelog)
+    schema.seed_accounts(conn, num_accounts=1, customer_ids=_customer_ids(conn), changelog=changelog)
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM accounts LIMIT 1")
         (account_id,) = cur.fetchone()
@@ -145,7 +163,7 @@ def test_transfer_conserves_total_balance(conn, tmp_path):
     try:
         schema.drop_transactions_table(conn, table_name)
         schema.create_transactions_table(conn, table_name)
-        schema.seed_accounts(conn, num_accounts=5, changelog=changelog)
+        schema.seed_accounts(conn, num_accounts=5, customer_ids=_customer_ids(conn), changelog=changelog)
         account_tracker = seed_from_table(conn, "accounts")
 
         with conn.cursor() as cur:
@@ -174,7 +192,7 @@ def test_cascade_delete_removes_only_the_targeted_accounts_children(conn, tmp_pa
     try:
         schema.drop_transactions_table(conn, table_name)
         schema.create_transactions_table(conn, table_name)
-        schema.seed_accounts(conn, num_accounts=3, changelog=changelog)
+        schema.seed_accounts(conn, num_accounts=3, customer_ids=_customer_ids(conn), changelog=changelog)
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM accounts")
             account_ids = [row[0] for row in cur.fetchall()]
@@ -247,7 +265,8 @@ def test_all_six_ddl_drift_operations_actually_apply(conn, tmp_path):
             cur.execute(
                 """SELECT data_type FROM information_schema.columns
                    WHERE table_schema=DATABASE() AND table_name=%s
-                   AND column_name NOT IN ('id','account_id','status','deleted_at','amount','transaction_ts')
+                   AND column_name NOT IN ('id','account_id','status','deleted_at','amount','transaction_ts',
+                                            'currency','transaction_type','counterparty_account_id')
                    ORDER BY column_name""",
                 (table_name,),
             )

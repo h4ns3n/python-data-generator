@@ -61,6 +61,7 @@ def cmd_seed(args):
         "num_tables": "--num_tables",
         "records_per_table": "--records_per_table",
         "num_accounts": "--num_accounts",
+        "num_customers": "--num_customers",
         "batch_size": "--batch_size",
         "num_workers": "--num_workers",
         "reset_all": "--reset_all",
@@ -75,6 +76,7 @@ def cmd_simulate(args):
         "num_tables": "--num_tables",
         "records_per_table": "--records_per_table",
         "num_accounts": "--num_accounts",
+        "num_customers": "--num_customers",
         "num_workers": "--num_workers",
         "duration": "--duration",
         "seed": "--seed",
@@ -157,6 +159,7 @@ def build_parser():
     p.add_argument("--num-tables", type=int, default=1, dest="num_tables")
     p.add_argument("--records-per-table", type=int, default=10000, dest="records_per_table")
     p.add_argument("--num-accounts", type=int, default=100, dest="num_accounts")
+    p.add_argument("--num-customers", type=int, default=50, dest="num_customers")
     p.add_argument("--batch-size", type=int, default=None, dest="batch_size")
     p.add_argument("--num-workers", type=int, default=None, dest="num_workers")
     p.add_argument("--reset-all", action="store_true", dest="reset_all")
@@ -166,6 +169,7 @@ def build_parser():
     p.add_argument("--num-tables", type=int, default=1, dest="num_tables")
     p.add_argument("--records-per-table", type=int, default=10000, dest="records_per_table")
     p.add_argument("--num-accounts", type=int, default=100, dest="num_accounts")
+    p.add_argument("--num-customers", type=int, default=50, dest="num_customers")
     p.add_argument("--num-workers", type=int, default=None, dest="num_workers")
     p.add_argument("--duration", type=float, default=None, help="Auto-stop after this many seconds (default: until Ctrl+C).")
     p.add_argument("--seed", type=int, default=None, help="Reproducible run — needed to compare Artie vs Openflow fairly.")

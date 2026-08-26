@@ -11,7 +11,8 @@ def test_get_columns_queries_information_schema():
 def test_get_driftable_columns_excludes_protected():
     cursor = FakeCursor(fetchall_return=[
         ("id",), ("account_id",), ("status",), ("deleted_at",), ("amount",),
-        ("transaction_ts",), ("description",), ("extra_ab12",),
+        ("transaction_ts",), ("currency",), ("transaction_type",), ("counterparty_account_id",),
+        ("description",), ("extra_ab12",),
     ])
     conn = FakeConn(cursor)
     assert schema.get_driftable_columns(conn, "transactions_1") == ["description", "extra_ab12"]
@@ -111,4 +112,42 @@ def test_run_random_ddl_drift_returns_none_when_nothing_applies(monkeypatch):
 def test_protected_columns_are_never_drift_targets():
     assert schema.PROTECTED_TRANSACTION_COLUMNS == {
         "id", "account_id", "status", "deleted_at", "amount", "transaction_ts",
+        "currency", "transaction_type", "counterparty_account_id",
     }
+
+
+def test_seed_customers_inserts_and_logs_per_row():
+    cursor = FakeCursor(fetchone_return=(0,), lastrowid=1)
+    conn = FakeConn(cursor)
+    changelog = FakeChangelog()
+    created = schema.seed_customers(conn, num_customers=2, changelog=changelog)
+    assert created == 2
+    assert conn.committed is True
+    sql, rows = cursor.executed[-1]
+    assert sql.startswith(f"INSERT INTO {schema.CUSTOMERS_TABLE}")
+    assert len(rows) == 2
+    assert len(changelog.entries) == 2
+    assert changelog.entries[0]["op"] == "insert"
+    assert changelog.entries[0]["table"] == schema.CUSTOMERS_TABLE
+
+
+def test_seed_customers_returns_zero_when_enough_already_exist():
+    cursor = FakeCursor(fetchone_return=(5,))
+    conn = FakeConn(cursor)
+    assert schema.seed_customers(conn, num_customers=5, changelog=FakeChangelog()) == 0
+
+
+def test_seed_accounts_assigns_customer_id_from_pool():
+    cursor = FakeCursor(fetchone_return=(0,), lastrowid=1)
+    conn = FakeConn(cursor)
+    changelog = FakeChangelog()
+    created = schema.seed_accounts(conn, num_accounts=3, customer_ids=[10, 11], changelog=changelog)
+    assert created == 3
+    sql, rows = cursor.executed[-1]
+    assert sql.startswith(f"INSERT INTO {schema.ACCOUNTS_TABLE}")
+    for customer_id, account_type, currency, balance in rows:
+        assert customer_id in (10, 11)
+        assert account_type in schema.ACCOUNT_TYPES
+        assert currency in schema.CURRENCIES
+    assert len(changelog.entries) == 3
+    assert changelog.entries[0]["table"] == schema.ACCOUNTS_TABLE

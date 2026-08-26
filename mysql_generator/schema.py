@@ -1,41 +1,74 @@
 import random
 import string
 
+CUSTOMERS_TABLE = "customers"
 ACCOUNTS_TABLE = "accounts"
 
 # Columns that DDL drift must never DROP/MODIFY/RENAME: id/account_id are the
 # PK/FK the cascading-delete relationship depends on, status/deleted_at are
-# load-bearing for soft-delete, and amount/transaction_ts are core row
-# metadata referenced by name throughout workload.py and meaningful to any
-# downstream analysis (transfer legs need a real monetary value; losing the
-# row's own timestamp loses CDC event ordering signal). Drift is interesting
-# and safe on description and anything a prior ADD COLUMN event introduced;
-# the DML layer re-introspects columns before writing so drift on those never
-# breaks it.
-PROTECTED_TRANSACTION_COLUMNS = {"id", "account_id", "status", "deleted_at", "amount", "transaction_ts"}
+# load-bearing for soft-delete, amount/transaction_ts are core row metadata
+# referenced by name throughout workload.py, and currency/transaction_type/
+# counterparty_account_id are the fintech-ledger fields transfer legs and any
+# downstream analysis depend on by name. Drift is interesting and safe on
+# description and anything a prior ADD COLUMN event introduced; the DML layer
+# re-introspects columns before writing so drift on those never breaks it.
+PROTECTED_TRANSACTION_COLUMNS = {
+    "id", "account_id", "status", "deleted_at", "amount", "transaction_ts",
+    "currency", "transaction_type", "counterparty_account_id",
+}
 
 DDL_COLUMN_TYPES = ["VARCHAR(50)", "INT", "DECIMAL(10,2)", "DATETIME", "TEXT"]
+
+ACCOUNT_TYPES = ["checking", "savings", "wallet"]
+CURRENCIES = ["USD", "EUR", "GBP", "ZAR"]
+TRANSACTION_TYPES = ["deposit", "withdrawal", "payment", "fee"]
+KYC_STATUSES = ["verified", "pending", "rejected"]
 
 
 def _random_suffix(n=6):
     return "".join(random.choices(string.ascii_lowercase, k=n))
 
 
+def create_customers_table(conn):
+    """
+    The top-level parent. Static reference data: deliberately frozen from
+    DDL drift and never deleted by this PoC, same rationale as accounts
+    below — accounts.customer_id references it, so it stays structurally
+    stable for the whole run.
+    """
+    sql = f"""
+    CREATE TABLE IF NOT EXISTS {CUSTOMERS_TABLE} (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        full_name VARCHAR(100) NOT NULL,
+        email VARCHAR(150) NOT NULL,
+        kyc_status VARCHAR(20) NOT NULL DEFAULT 'verified',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+
 def create_accounts_table(conn):
     """
-    The one shared parent table. Deliberately frozen from DDL drift (see
-    mysql_generator.schema.PROTECTED_TRANSACTION_COLUMNS docstring above and
-    run_random_ddl_drift's table selection in the CLI): every transactions_{n}
-    table references it, and balance is load-bearing for the transfer
-    conservation invariant, so it stays structurally stable for the whole run.
+    Shared parent for every transactions_{n} table. Deliberately frozen from
+    DDL drift (see mysql_generator.schema.PROTECTED_TRANSACTION_COLUMNS
+    docstring above and run_random_ddl_drift's table selection in the CLI):
+    every transactions_{n} table references it, and balance is load-bearing
+    for the transfer conservation invariant, so it stays structurally stable
+    for the whole run.
     """
     sql = f"""
     CREATE TABLE IF NOT EXISTS {ACCOUNTS_TABLE} (
         id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        customer_id BIGINT NOT NULL,
+        account_type VARCHAR(20) NOT NULL DEFAULT 'checking',
+        currency CHAR(3) NOT NULL DEFAULT 'USD',
         balance DECIMAL(14,2) NOT NULL DEFAULT 0,
-        owner_name VARCHAR(100),
         status VARCHAR(20) NOT NULL DEFAULT 'active',
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (customer_id) REFERENCES {CUSTOMERS_TABLE}(id) ON DELETE CASCADE
     );
     """
     with conn.cursor() as cur:
@@ -49,12 +82,17 @@ def create_transactions_table(conn, table_name):
     at creation, never part of the DDL-drift pool — the cascade relationship
     is the thing under test, not itself a variable). status/deleted_at support
     soft-delete mode without relying on a drift event to add them.
+    currency/transaction_type/counterparty_account_id are the fintech-ledger
+    fields transfer() writes on each leg; see PROTECTED_TRANSACTION_COLUMNS.
     """
     sql = f"""
     CREATE TABLE IF NOT EXISTS {table_name} (
         id BIGINT AUTO_INCREMENT PRIMARY KEY,
         transaction_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        amount DECIMAL(10,2) NOT NULL,
+        transaction_type VARCHAR(20) NOT NULL DEFAULT 'payment',
+        amount DECIMAL(14,2) NOT NULL,
+        currency CHAR(3) NOT NULL DEFAULT 'USD',
+        counterparty_account_id BIGINT NULL,
         description TEXT,
         account_id BIGINT NOT NULL,
         status VARCHAR(20) NOT NULL DEFAULT 'active',
@@ -79,11 +117,19 @@ def drop_accounts_table(conn):
     conn.commit()
 
 
+def drop_customers_table(conn):
+    with conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {CUSTOMERS_TABLE};")
+    conn.commit()
+
+
 def reset_schema(conn, table_names):
-    """Drop children first (FK dependency), then accounts, then recreate all."""
+    """Drop children first (FK dependency), then accounts, then customers, then recreate all."""
     for table_name in table_names:
         drop_transactions_table(conn, table_name)
     drop_accounts_table(conn)
+    drop_customers_table(conn)
+    create_customers_table(conn)
     create_accounts_table(conn)
     for table_name in table_names:
         create_transactions_table(conn, table_name)
@@ -91,34 +137,67 @@ def reset_schema(conn, table_names):
 
 def teardown_all(conn):
     """
-    --drop_database: remove every table this tool owns (transactions_* and
-    accounts), not the database object itself. Keeping the database avoids
-    disturbing grants/config tied to it if the config ever points somewhere
-    shared; dropping every owned table gets the same practical "make it
-    disappear" outcome for this ephemeral PoC schema.
+    --drop_database: remove every table this tool owns (transactions_*,
+    accounts, and customers), not the database object itself. Keeping the
+    database avoids disturbing grants/config tied to it if the config ever
+    points somewhere shared; dropping every owned table gets the same
+    practical "make it disappear" outcome for this ephemeral PoC schema.
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT table_name FROM information_schema.tables
             WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
-              AND (table_name = %s OR table_name LIKE 'transactions\\_%%')
+              AND (table_name IN (%s, %s) OR table_name LIKE 'transactions\\_%%')
             """,
-            (ACCOUNTS_TABLE,),
+            (ACCOUNTS_TABLE, CUSTOMERS_TABLE),
         )
         tables = [row[0] for row in cur.fetchall()]
 
-    children = [t for t in tables if t != ACCOUNTS_TABLE]
+    children = [t for t in tables if t not in (ACCOUNTS_TABLE, CUSTOMERS_TABLE)]
     with conn.cursor() as cur:
         for table_name in children:
             cur.execute(f"DROP TABLE IF EXISTS {table_name};")
         if ACCOUNTS_TABLE in tables:
             cur.execute(f"DROP TABLE IF EXISTS {ACCOUNTS_TABLE};")
+        if CUSTOMERS_TABLE in tables:
+            cur.execute(f"DROP TABLE IF EXISTS {CUSTOMERS_TABLE};")
     conn.commit()
     return tables
 
 
-def seed_accounts(conn, num_accounts, changelog=None):
+def seed_customers(conn, num_customers, changelog=None):
+    """
+    Ensure at least num_customers rows exist in the shared customers table.
+    Low-volume like accounts, so log one changelog entry per customer rather
+    than an aggregate count (see seed_accounts below for the same rationale).
+    """
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {CUSTOMERS_TABLE}")
+        (count,) = cur.fetchone()
+    if count >= num_customers:
+        return 0
+
+    to_create = num_customers - count
+    rows = [
+        (f"Customer {count + i}", f"customer_{count + i}@example.test", random.choice(KYC_STATUSES))
+        for i in range(to_create)
+    ]
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO {CUSTOMERS_TABLE} (full_name, email, kyc_status) VALUES (%s, %s, %s)", rows
+        )
+        first_id = cur.lastrowid
+    conn.commit()
+    if changelog:
+        for i, (full_name, email, kyc_status) in enumerate(rows):
+            changelog.write(
+                "insert", CUSTOMERS_TABLE, id=first_id + i, full_name=full_name, email=email, kyc_status=kyc_status
+            )
+    return to_create
+
+
+def seed_accounts(conn, num_accounts, customer_ids, changelog=None):
     """
     Ensure at least num_accounts rows exist in the shared accounts table.
     Accounts are low-volume (dozens/hundreds, not millions like transaction
@@ -134,14 +213,28 @@ def seed_accounts(conn, num_accounts, changelog=None):
         return 0
 
     to_create = num_accounts - count
-    rows = [(round(random.uniform(100.0, 100000.0), 2), f"owner_{count + i}") for i in range(to_create)]
+    rows = [
+        (
+            random.choice(customer_ids),
+            random.choice(ACCOUNT_TYPES),
+            random.choice(CURRENCIES),
+            round(random.uniform(100.0, 100000.0), 2),
+        )
+        for _ in range(to_create)
+    ]
     with conn.cursor() as cur:
-        cur.executemany(f"INSERT INTO {ACCOUNTS_TABLE} (balance, owner_name) VALUES (%s, %s)", rows)
+        cur.executemany(
+            f"INSERT INTO {ACCOUNTS_TABLE} (customer_id, account_type, currency, balance) VALUES (%s, %s, %s, %s)",
+            rows,
+        )
         first_id = cur.lastrowid
     conn.commit()
     if changelog:
-        for i, (balance, owner_name) in enumerate(rows):
-            changelog.write("insert", ACCOUNTS_TABLE, id=first_id + i, balance=str(balance), owner_name=owner_name)
+        for i, (customer_id, account_type, currency, balance) in enumerate(rows):
+            changelog.write(
+                "insert", ACCOUNTS_TABLE, id=first_id + i, customer_id=customer_id,
+                account_type=account_type, currency=currency, balance=str(balance),
+            )
     return to_create
 
 

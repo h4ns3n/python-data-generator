@@ -1,4 +1,4 @@
-from mysql_generator import workload
+from mysql_generator import schema, workload
 from mysql_generator.ids import IdTracker
 from tests.doubles import FakeChangelog, FakeConn, FakeCursor
 
@@ -6,10 +6,12 @@ from tests.doubles import FakeChangelog, FakeConn, FakeCursor
 def test_generate_seed_batch_shape():
     batch = workload.generate_seed_batch(10, account_ids=[1, 2, 3])
     assert len(batch) == 10
-    for amount, description, account_id in batch:
+    for amount, description, account_id, transaction_type, currency in batch:
         assert 1.0 <= amount <= 1000.0
         assert len(description) == 10
         assert account_id in [1, 2, 3]
+        assert transaction_type in schema.TRANSACTION_TYPES
+        assert currency in schema.CURRENCIES
 
 
 def test_insert_transaction_includes_description_when_column_present():
@@ -22,7 +24,7 @@ def test_insert_transaction_includes_description_when_column_present():
     assert conn.committed is True
     sql, params = cursor.executed[-1]
     assert "description" in sql
-    assert len(params) == 3
+    assert len(params) == 5
     assert changelog.entries[0]["op"] == "insert"
     assert changelog.entries[0]["account_id"] == 3
 
@@ -34,7 +36,7 @@ def test_insert_transaction_omits_description_when_column_dropped():
     workload.insert_transaction(conn, "transactions_1", account_id=3, changelog=changelog)
     sql, params = cursor.executed[-1]
     assert "description" not in sql
-    assert len(params) == 2
+    assert len(params) == 4
 
 
 def test_update_transaction_returns_none_when_no_target_row(monkeypatch):

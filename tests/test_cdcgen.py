@@ -38,7 +38,7 @@ def test_simulate_subcommand_builds_expected_flags():
     args = parser.parse_args(["simulate", "--num-tables", "2", "--duration", "60", "--seed", "7"])
     mapping = {
         "num_tables": "--num_tables", "records_per_table": "--records_per_table",
-        "num_accounts": "--num_accounts", "num_workers": "--num_workers",
+        "num_accounts": "--num_accounts", "num_customers": "--num_customers", "num_workers": "--num_workers",
         "duration": "--duration", "seed": "--seed", "delay": "--delay",
         "insert_ratio": "--insert_ratio", "update_ratio": "--update_ratio",
         "delete_ratio": "--delete_ratio", "transfer_ratio": "--transfer_ratio",

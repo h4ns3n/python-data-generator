@@ -106,28 +106,44 @@ Database schema and operations (Postgres — simulate_data.py)
   ONLY simulate mode Postgres has — it does not have DDL drift, transfers, cascading
   deletes, or a changelog; those are MySQL-only (see below).
 
-MySQL two-tier schema (mysql_generator/schema.py)
-- accounts (one shared parent table, ACCOUNTS_TABLE constant): id BIGINT AUTO_INCREMENT
-  PK, balance DECIMAL(14,2), owner_name, status, created_at.
+MySQL three-tier schema (mysql_generator/schema.py)
+- customers (top-level parent, CUSTOMERS_TABLE constant): id BIGINT AUTO_INCREMENT PK,
+  full_name, email, kyc_status, created_at.
+  DELIBERATELY FROZEN from DDL drift and never deleted by this PoC — static reference
+  data, same rationale as accounts below. accounts.customer_id FK's to it.
+- accounts (shared parent for every transactions_{n} table, ACCOUNTS_TABLE constant):
+  id BIGINT AUTO_INCREMENT PK, customer_id BIGINT NOT NULL (FK -> customers(id) ON
+  DELETE CASCADE), account_type (checking/savings/wallet), currency CHAR(3),
+  balance DECIMAL(14,2), status, created_at.
   DELIBERATELY FROZEN from DDL drift — every transactions_{n} table references it via
   FK, and balance is load-bearing for the transfer conservation invariant. Never add it
   to a drift pool.
-- transactions_{n} (N child tables, --num_tables as before): id, transaction_ts, amount,
+- transactions_{n} (N child tables, --num_tables as before): id, transaction_ts,
+  transaction_type (deposit/withdrawal/payment/fee/transfer_in/transfer_out), amount,
+  currency CHAR(3), counterparty_account_id BIGINT NULL (set only on transfer legs),
   description, account_id BIGINT NOT NULL, status, deleted_at.
   FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE — fixed at table
   creation, NEVER part of the DDL-drift pool (the cascade relationship is the thing
-  under test, not itself a variable).
+  under test, not itself a variable). NOTE: status/deleted_at keep their original
+  row-lifecycle meaning (active/deleted, backing soft-delete) — they are NOT a
+  fintech "transaction status" field; transaction_type carries the domain semantics
+  instead, specifically so the soft-delete WHERE clauses never had to change.
 - PROTECTED_TRANSACTION_COLUMNS = {id, account_id, status, deleted_at, amount,
-  transaction_ts} — these can never be DROP/MODIFY/RENAME'd by drift. id/account_id are
-  the PK/FK; status/deleted_at back soft-delete; amount/transaction_ts are core row
-  metadata referenced by name throughout mysql_generator/workload.py (a transfer leg
-  with no amount is meaningless) and matter for downstream CDC analysis. This list grew
-  during implementation — amount and transaction_ts were both found missing via a real
-  smoke test against the live cluster (DDL drift silently dropped them and nothing broke
-  functionally, but it was clearly wrong); if you add a new column that other code
-  references by name, protect it too.
+  transaction_ts, currency, transaction_type, counterparty_account_id} — these can
+  never be DROP/MODIFY/RENAME'd by drift. id/account_id are the PK/FK; status/deleted_at
+  back soft-delete; amount/transaction_ts are core row metadata referenced by name
+  throughout mysql_generator/workload.py (a transfer leg with no amount is meaningless);
+  currency/transaction_type/counterparty_account_id are the fintech-ledger fields
+  transfer() writes on each leg. This list grew during implementation — amount and
+  transaction_ts were both found missing via a real smoke test against the live cluster
+  (DDL drift silently dropped them and nothing broke functionally, but it was clearly
+  wrong); if you add a new column that other code references by name, protect it too.
   Only "description" and any column a prior ADD COLUMN drift event introduced are
   genuinely driftable.
+- Known simplification: a transaction row's currency is chosen from a small synthetic
+  pool (schema.CURRENCIES) independent of its parent account's currency — matching-
+  currency FX correctness isn't part of what this PoC verifies (it verifies row-level
+  DDL/DML capture), so a currency lookup per operation was deliberately skipped.
 
 MySQL DDL drift (mysql_generator/schema.py: DDL_OPERATIONS, run_random_ddl_drift)
 - Six operations, all scoped to transactions_{n} tables only (never accounts):
@@ -256,11 +272,13 @@ CLI contracts
 - test_connection.py flags: --config, --alias (same semantics as above).
 - simulate_data_mysql.py additional/changed flags beyond the Postgres set:
   - --num_accounts (default 100): rows to seed in the shared accounts table.
+  - --num_customers (default 50): rows to seed in the shared customers table. Each new
+    account is assigned a random existing customer_id from this pool.
   - --reset_all / --reset_tables now only drop+recreate the specified transactions_{n}
     tables — accounts is left intact (it's shared infrastructure, not per-run disposable;
     only --drop_database removes it).
-  - --drop_database: teardown — drops every table this tool owns (transactions_* and
-    accounts) via information_schema lookup, then exits. Does NOT issue DROP DATABASE
+  - --drop_database: teardown — drops every table this tool owns (transactions_*,
+    accounts, and customers) via information_schema lookup, then exits. Does NOT issue DROP DATABASE
     (avoids disturbing grants/config if the config alias ever points somewhere shared);
     dropping every owned table is practically equivalent for this ephemeral PoC schema.
   - --duration (seconds, optional): auto-stop --simulate after this long, for running

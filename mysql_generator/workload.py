@@ -15,11 +15,18 @@ def _random_amount(lo=1.0, hi=1000.0):
 
 
 def generate_seed_batch(batch_size, account_ids):
-    return [(_random_amount(), _random_description(), random.choice(account_ids)) for _ in range(batch_size)]
+    return [
+        (_random_amount(), _random_description(), random.choice(account_ids),
+         random.choice(schema.TRANSACTION_TYPES), random.choice(schema.CURRENCIES))
+        for _ in range(batch_size)
+    ]
 
 
 def bulk_insert_batch(conn, table_name, batch, changelog=None):
-    insert_sql = f"INSERT INTO {table_name} (amount, description, account_id) VALUES (%s, %s, %s)"
+    insert_sql = (
+        f"INSERT INTO {table_name} (amount, description, account_id, transaction_type, currency) "
+        "VALUES (%s, %s, %s, %s, %s)"
+    )
     with conn.cursor() as cur:
         cur.executemany(insert_sql, batch)
     conn.commit()
@@ -38,13 +45,18 @@ def _has_description(conn, table_name):
 
 def insert_transaction(conn, table_name, account_id, changelog):
     amount = _random_amount()
+    transaction_type = random.choice(schema.TRANSACTION_TYPES)
+    currency = random.choice(schema.CURRENCIES)
     has_description = _has_description(conn, table_name)
     if has_description:
-        sql = f"INSERT INTO {table_name} (amount, description, account_id) VALUES (%s, %s, %s)"
-        params = (amount, _random_description(), account_id)
+        sql = (
+            f"INSERT INTO {table_name} (amount, description, account_id, transaction_type, currency) "
+            "VALUES (%s, %s, %s, %s, %s)"
+        )
+        params = (amount, _random_description(), account_id, transaction_type, currency)
     else:
-        sql = f"INSERT INTO {table_name} (amount, account_id) VALUES (%s, %s)"
-        params = (amount, account_id)
+        sql = f"INSERT INTO {table_name} (amount, account_id, transaction_type, currency) VALUES (%s, %s, %s, %s)"
+        params = (amount, account_id, transaction_type, currency)
     with conn.cursor() as cur:
         cur.execute(sql, params)
         new_id = cur.lastrowid
@@ -174,12 +186,19 @@ def transfer(conn, table_names, account_tracker, changelog):
         return None
 
     amount = _random_amount()
+    currency = random.choice(schema.CURRENCIES)
     table_name = random.choice(table_names)
     has_description = _has_description(conn, table_name)
     if has_description:
-        insert_sql = f"INSERT INTO {table_name} (amount, description, account_id) VALUES (%s, %s, %s)"
+        insert_sql = (
+            f"INSERT INTO {table_name} (amount, description, account_id, transaction_type, currency, "
+            "counterparty_account_id) VALUES (%s, %s, %s, %s, %s, %s)"
+        )
     else:
-        insert_sql = f"INSERT INTO {table_name} (amount, account_id) VALUES (%s, %s)"
+        insert_sql = (
+            f"INSERT INTO {table_name} (amount, account_id, transaction_type, currency, counterparty_account_id) "
+            "VALUES (%s, %s, %s, %s, %s)"
+        )
 
     with conn.cursor() as cur:
         cur.execute(
@@ -192,10 +211,14 @@ def transfer(conn, table_names, account_tracker, changelog):
 
         cur.execute(f"UPDATE {ACCOUNTS_TABLE} SET balance = balance + %s WHERE id=%s", (amount, account_id_to))
 
-        cur.execute(insert_sql, (-amount, "transfer_out", account_id_from) if has_description else (-amount, account_id_from))
+        leg_out_params = (-amount, _random_description(), account_id_from, "transfer_out", currency, account_id_to) \
+            if has_description else (-amount, account_id_from, "transfer_out", currency, account_id_to)
+        cur.execute(insert_sql, leg_out_params)
         leg_out_id = cur.lastrowid
 
-        cur.execute(insert_sql, (amount, "transfer_in", account_id_to) if has_description else (amount, account_id_to))
+        leg_in_params = (amount, _random_description(), account_id_to, "transfer_in", currency, account_id_from) \
+            if has_description else (amount, account_id_to, "transfer_in", currency, account_id_from)
+        cur.execute(insert_sql, leg_in_params)
         leg_in_id = cur.lastrowid
 
     conn.commit()

@@ -19,12 +19,21 @@ def test_assert_writable_passes_on_real_mysql(conn):
     assert_writable(conn)  # a fresh testcontainers instance is never read-only
 
 
+def _seeded_customer_ids(conn, changelog, num_customers=2):
+    schema.create_customers_table(conn)
+    schema.seed_customers(conn, num_customers=num_customers, changelog=changelog)
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM customers")
+        return [row[0] for row in cur.fetchall()]
+
+
 def test_schema_creation_and_cascade_delete(conn, tmp_path):
+    changelog = Changelog(str(tmp_path / "cl.jsonl"))
+    customer_ids = _seeded_customer_ids(conn, changelog)
     schema.create_accounts_table(conn)
     schema.create_transactions_table(conn, "transactions_1")
 
-    changelog = Changelog(str(tmp_path / "cl.jsonl"))
-    schema.seed_accounts(conn, num_accounts=2, changelog=changelog)
+    schema.seed_accounts(conn, num_accounts=2, customer_ids=customer_ids, changelog=changelog)
 
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM accounts ORDER BY id")
@@ -55,10 +64,11 @@ def test_schema_creation_and_cascade_delete(conn, tmp_path):
 
 
 def test_transfer_conserves_total_balance(conn, tmp_path):
+    changelog = Changelog(str(tmp_path / "cl.jsonl"))
+    customer_ids = _seeded_customer_ids(conn, changelog)
     schema.create_accounts_table(conn)
     schema.create_transactions_table(conn, "transactions_1")
-    changelog = Changelog(str(tmp_path / "cl.jsonl"))
-    schema.seed_accounts(conn, num_accounts=2, changelog=changelog)
+    schema.seed_accounts(conn, num_accounts=2, customer_ids=customer_ids, changelog=changelog)
 
     with conn.cursor() as cur:
         cur.execute("SELECT SUM(balance) FROM accounts")
@@ -81,10 +91,11 @@ def test_transfer_conserves_total_balance(conn, tmp_path):
 
 
 def test_soft_delete_never_cascades(conn, tmp_path):
+    changelog = Changelog(str(tmp_path / "cl.jsonl"))
+    customer_ids = _seeded_customer_ids(conn, changelog)
     schema.create_accounts_table(conn)
     schema.create_transactions_table(conn, "transactions_1")
-    changelog = Changelog(str(tmp_path / "cl.jsonl"))
-    schema.seed_accounts(conn, num_accounts=1, changelog=changelog)
+    schema.seed_accounts(conn, num_accounts=1, customer_ids=customer_ids, changelog=changelog)
 
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM accounts LIMIT 1")
@@ -105,9 +116,10 @@ def test_soft_delete_never_cascades(conn, tmp_path):
 
 
 def test_ddl_drift_add_and_drop_column(conn, tmp_path):
+    changelog = Changelog(str(tmp_path / "cl.jsonl"))
+    _seeded_customer_ids(conn, changelog)
     schema.create_accounts_table(conn)
     schema.create_transactions_table(conn, "transactions_1")
-    changelog = Changelog(str(tmp_path / "cl.jsonl"))
 
     op_name = schema.ddl_add_column(conn, "transactions_1", changelog)
     assert op_name is True
@@ -126,10 +138,11 @@ def test_ddl_drift_add_and_drop_column(conn, tmp_path):
 
 
 def test_ddl_drift_quiesce_gate_with_real_connections(conn, db_params, tmp_path):
+    changelog = Changelog(str(tmp_path / "cl.jsonl"))
+    customer_ids = _seeded_customer_ids(conn, changelog)
     schema.create_accounts_table(conn)
     schema.create_transactions_table(conn, "transactions_1")
-    changelog = Changelog(str(tmp_path / "cl.jsonl"))
-    schema.seed_accounts(conn, num_accounts=1, changelog=changelog)
+    schema.seed_accounts(conn, num_accounts=1, customer_ids=customer_ids, changelog=changelog)
 
     gate = QuiesceGate()
     dml_conn = pymysql.connect(**db_params)

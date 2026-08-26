@@ -200,6 +200,8 @@ def main():
                         help="Number of rows to bulk-seed per table before simulation (1000 to 10000000).")
     parser.add_argument("--num_accounts", type=int, default=100,
                         help="Number of rows to seed in the shared accounts table.")
+    parser.add_argument("--num_customers", type=int, default=50,
+                        help="Number of rows to seed in the shared customers table.")
     parser.add_argument("--batch_size", type=int, default=10000,
                         help="Batch size used for the initial bulk-seed inserts.")
     parser.add_argument("--num_workers", type=int, default=1,
@@ -290,8 +292,15 @@ def main():
 
     changelog = Changelog(args.changelog)
 
+    schema.create_customers_table(conn)
+    schema.seed_customers(conn, args.num_customers, changelog=changelog)
+
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT id FROM {schema.CUSTOMERS_TABLE}")
+        customer_ids = [row[0] for row in cur.fetchall()]
+
     schema.create_accounts_table(conn)
-    schema.seed_accounts(conn, args.num_accounts, changelog=changelog)
+    schema.seed_accounts(conn, args.num_accounts, customer_ids, changelog=changelog)
 
     with conn.cursor() as cur:
         cur.execute(f"SELECT id FROM {workload.ACCOUNTS_TABLE}")
