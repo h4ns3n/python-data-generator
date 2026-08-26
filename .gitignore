@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # macOS
 .DS_Store
@@ -11,3 +12,6 @@ venv/
 
 # Local database config (keep secrets out of VCS)
 python-datasource.json
+
+# Generated ground-truth changelogs (run output, not source)
+*.jsonl

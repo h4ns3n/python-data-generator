@@ -1,20 +1,58 @@
-Project: Python Postgres Data Generator
+Project: Python Postgres/MySQL Data Generator
 
 Goal
-- Provide clear guardrails for maintaining and extending a small Python utility that generates sample transaction data in Postgres and verifies connectivity.
+- Provide clear guardrails for maintaining and extending a small Python utility that
+  generates sample transaction data in Postgres or MySQL and verifies connectivity.
+- The MySQL path additionally supports a production-realistic DDL+DML simulation mode
+  (schema drift, transfers, cascading deletes, soft deletes) built for a CDC ingestion
+  PoC (Artie and Snowflake Openflow reading Aurora MySQL binlogs) — see "MySQL DDL/DML
+  simulation" below. The Postgres path remains the original, simpler bulk-insert tool.
 
 Tech stack and runtime
 - Python 3.x (CLI scripts)
 - Postgres via psycopg2 (including execute_values for batch inserts)
+- MySQL via PyMySQL (executemany for batch inserts; no built-in connection pooling, so
+  a small hand-rolled queue-based pool stands in for psycopg2.pool.SimpleConnectionPool)
 - Optional: tqdm for progress bars
+- pytest for tests; testcontainers[mysql] for dockerized MySQL integration tests
+- requirements.txt pins psycopg2-binary, PyMySQL, tqdm, pytest, testcontainers[mysql].
+  Install into a local venv/ (gitignored): python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 
 Key files
-- simulate_data.py: Main data generator. Creates/reset tables, inserts data sequentially or concurrently, and can simulate continuous production traffic.
+- simulate_data.py: Postgres data generator. Creates/reset tables, inserts data
+  sequentially or concurrently, and can simulate continuous production traffic.
 - test_connection.py: Simple connectivity check that prints the Postgres version.
-- python-datasource.json: JSON config containing JDBC-style URL and credentials for a named alias.
+- cdcgen.py: convenience CLI wrapping the MySQL scripts (check/seed/simulate/reset/
+  teardown/verify/selftest subcommands, kebab-case flags, defaults to
+  python-datasource.json / CDC_POC_MYSQL). A thin subprocess dispatcher, not new
+  logic — the scripts below remain the source of truth and stay directly runnable
+  for anything cdcgen.py doesn't expose. See `./cdcgen.py --help` / `<subcommand> --help`.
+- simulate_data_mysql.py: MySQL CLI entrypoint — bulk-seed phase plus the DDL+DML
+  --simulate mode. Orchestration only; the actual logic lives in mysql_generator/.
+- test_connection_mysql.py: MySQL connectivity check; also reports writer/reader role.
+- mysql_generator/: package holding all MySQL-specific logic (see below).
+- verify_snowflake.py + snowflake_verify/: separate tool that diffs Snowflake state
+  against the generator's changelog (see "Verification tooling" below).
+- python-datasource.json: JSON config containing JDBC-style URL and credentials for a
+  named alias (Postgres and MySQL aliases can coexist in the same file). Gitignored —
+  never commit real credentials.
+- tests/: pytest suite — unit tests (mocked, always run), tests/integration/ (dockerized
+  MySQL via testcontainers, auto-skips if Docker isn't available), tests/live/ (hits the
+  real PoC cluster, opt-in via `pytest -m live_cluster`, skips if python-datasource.json
+  is absent).
+
+Vendor separation
+- Postgres and MySQL are deliberately kept as separate script pairs rather than unified
+  behind a --db-type flag. The dialects differ enough (execute_values vs executemany,
+  SERIAL vs AUTO_INCREMENT, sslmode string vs ssl dict, native vs hand-rolled pooling,
+  and now DDL-drift/transfer/cascade semantics that only exist on the MySQL side) that
+  branching inside shared functions would add more complexity than it removes. Keep this
+  pattern for any future dialect (mirror the file pair, don't merge them). Postgres has
+  not been extended with the DDL/DML simulation capability described below — that was
+  scoped to the active MySQL CDC PoC only; treat it as backlog if Postgres ever needs it.
 
 Configuration model
-- JSON schema per alias:
+- JSON schema per alias (Postgres):
   {
     "PSQLDS1": {
       "url": "jdbc:postgresql://host:port/dbname",
@@ -23,40 +61,186 @@ Configuration model
       "ssl": true|false
     }
   }
-- parse_jdbc_url converts JDBC URL → psycopg2 params {host, port, dbname}.
-- ssl handling: map ssl true → sslmode=require; false/omitted → sslmode=disable.
+- JSON schema per alias (MySQL) — same shape, jdbc:mysql:// scheme:
+  {
+    "MYSQLDS1": {
+      "url": "jdbc:mysql://host:port/dbname",
+      "username": "...",
+      "password": "...",
+      "ssl": true|false
+    }
+  }
+- parse_jdbc_url (mysql_generator/config.py for MySQL) converts JDBC URL → driver
+  connection params {host, port, dbname/database}.
+- ssl handling (Postgres): map ssl true → sslmode=require; false/omitted → sslmode=disable.
+- ssl handling (MySQL): map ssl true → PyMySQL ssl={} (enables TLS with the default
+  context; PyMySQL treats the ssl kwarg as ssl.wrap_socket()-style kwargs, NOT a
+  mysql-connector-style {"ssl_mode": "REQUIRED"} dict — that shape is silently wrong
+  and causes connect() to hang rather than raise, so don't reintroduce it). ssl
+  false/omitted → no ssl kwarg passed.
 - Prefer placing configs at repo root as "python-datasource.json" for consistency across scripts.
 
-Database schema and operations
+Aurora reader/writer gotcha (MySQL only)
+- Aurora MySQL only generates binlogs on the writer; the reader has no binlog of its own
+  and rejects all DDL/DML. mysql_generator/guard.py's assert_writable() checks this at
+  connect time and fails fast with a clear message before any statement runs.
+- The naive check is wrong: Aurora readers report @@read_only=0 (that variable reflects
+  standalone-MySQL replication state, which Aurora's shared-storage architecture doesn't
+  use). The actual signal is @@innodb_read_only=1. This was confirmed against the real
+  cluster — don't revert to @@read_only.
+
+Database schema and operations (Postgres — simulate_data.py)
 - Table pattern: transactions_{n}
   - id SERIAL PRIMARY KEY
   - transaction_ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
   - amount NUMERIC(10,2) NOT NULL
   - description TEXT
-- Table lifecycle helpers:
-  - create_table_if_not_exists(conn, table_name)
-  - reset_table(conn, table_name) → DROP then re-create
+- Table lifecycle helpers: create_table_if_not_exists(conn, table_name),
+  reset_table(conn, table_name) → DROP then re-create.
+- Record fields: amount (random float [1.00, 1000.00]), description (random 10-char
+  alphanumeric). Batch inserts use psycopg2.extras.execute_values.
+- Concurrency: ThreadPoolExecutor + psycopg2.pool.SimpleConnectionPool sized to
+  num_workers. Batches generated lazily via generate_batches.
+- simulate_production(conn, table_names, batch_size, delay): continuously inserts
+  batches into random tables, sleeping between batches (Ctrl+C to stop). This is the
+  ONLY simulate mode Postgres has — it does not have DDL drift, transfers, cascading
+  deletes, or a changelog; those are MySQL-only (see below).
 
-Data generation and insertion
-- Record fields:
-  - amount: random float in [1.00, 1000.00], rounded to 2 decimals
-  - description: random 10-char alphanumeric
-- Batch inserts use psycopg2.extras.execute_values for performance.
-- Commit once per batch; on errors, rollback and surface the exception (concurrent path already rolls back and returns connection to the pool).
-- Progress: attempt to import tqdm; if unavailable, proceed without a progress bar.
+MySQL two-tier schema (mysql_generator/schema.py)
+- accounts (one shared parent table, ACCOUNTS_TABLE constant): id BIGINT AUTO_INCREMENT
+  PK, balance DECIMAL(14,2), owner_name, status, created_at.
+  DELIBERATELY FROZEN from DDL drift — every transactions_{n} table references it via
+  FK, and balance is load-bearing for the transfer conservation invariant. Never add it
+  to a drift pool.
+- transactions_{n} (N child tables, --num_tables as before): id, transaction_ts, amount,
+  description, account_id BIGINT NOT NULL, status, deleted_at.
+  FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE — fixed at table
+  creation, NEVER part of the DDL-drift pool (the cascade relationship is the thing
+  under test, not itself a variable).
+- PROTECTED_TRANSACTION_COLUMNS = {id, account_id, status, deleted_at, amount,
+  transaction_ts} — these can never be DROP/MODIFY/RENAME'd by drift. id/account_id are
+  the PK/FK; status/deleted_at back soft-delete; amount/transaction_ts are core row
+  metadata referenced by name throughout mysql_generator/workload.py (a transfer leg
+  with no amount is meaningless) and matter for downstream CDC analysis. This list grew
+  during implementation — amount and transaction_ts were both found missing via a real
+  smoke test against the live cluster (DDL drift silently dropped them and nothing broke
+  functionally, but it was clearly wrong); if you add a new column that other code
+  references by name, protect it too.
+  Only "description" and any column a prior ADD COLUMN drift event introduced are
+  genuinely driftable.
 
-Concurrency model
-- Two modes:
-  - Sequential: insert_records(conn, table_name, num_records, batch_size)
-  - Concurrent: insert_records_concurrent(db_params, table_name, num_records, batch_size, num_workers)
-- Concurrency uses ThreadPoolExecutor and SimpleConnectionPool(max=num_workers).
-- Batches are generated lazily via generate_batches to avoid large memory spikes.
+MySQL DDL drift (mysql_generator/schema.py: DDL_OPERATIONS, run_random_ddl_drift)
+- Six operations, all scoped to transactions_{n} tables only (never accounts):
+  add_column, drop_column, modify_column, rename_column, add_index, drop_index.
+- add_index on a TEXT/BLOB column needs an explicit key-length prefix in MySQL (error
+  1170 otherwise) — ddl_add_index handles this (TEXT_BLOB_TYPES set, `col(50)` prefix).
+  Found via smoke test; don't regress it.
+- drop_index only ever drops indexes whose name matches the "idx_" prefix this tool
+  itself uses in ddl_add_index — never PRIMARY, never the FK-required index on
+  account_id. This is enforced by naming convention, not a live FK-usage check, so keep
+  that prefix convention if you add more index-creating drift.
+- Per-table independent scheduling: each table gets its own next-fire time, jittered
+  0.5x–1.5x around --ddl_interval_seconds, re-randomized after each fire (see
+  simulate_data_mysql.py: run_simulation's ddl_loop).
+- run_random_ddl_drift tries ops in random order until one actually applies (e.g.
+  drop_column is a no-op with nothing driftable yet) and returns the op name, or None.
 
-Simulation mode
-- simulate_production(conn, table_names, batch_size, delay): continuously inserts batches into random tables, sleeping between batches.
-- Intended for exercising downstream pipelines (Ctrl+C to stop).
+Concurrency safety around DDL drift (mysql_generator/concurrency.py: QuiesceGate)
+- A single global gate, not per-table: DML operations wrap in gate.dml_guard() (readers),
+  a firing DDL event wraps in gate.ddl_section() (writer) — blocks new DML from starting
+  and waits for in-flight DML to finish before the ALTER runs. Deliberately simple:
+  migrations are rare (~minutes apart) and each DML op is a single-statement commit, so a
+  brief global pause is cheap and much easier to reason about than per-table RW locks.
+- mysql_generator/workload.py's insert/update/transfer re-introspect current columns
+  (schema.get_columns) before building SQL rather than hardcoding "amount, description"
+  — this is what lets DROP/RENAME COLUMN drift on "description" happen mid-run without
+  breaking the DML layer. amount/transaction_ts don't need this because they're
+  protected and always present.
+- Both the DDL loop and DML workers in simulate_data_mysql.py catch pymysql.err.MySQLError
+  broadly (not just OperationalError — IntegrityError from a genuine concurrent-delete
+  race was seen in testing), roll back, log, and continue rather than crashing the
+  worker/thread. This was a real bug found via smoke test (concurrent insert racing a
+  cascading account delete raised IntegrityError, which the narrower except clause let
+  propagate and silently killed a worker thread).
+
+MySQL DML operation mix (mysql_generator/workload.py, dispatched from simulate_data_mysql.py:_dml_tick)
+- Four operation types, weighted: --insert_ratio (60), --update_ratio (30),
+  --delete_ratio (10), --transfer_ratio (5, supplementary — drawn from the same weighted
+  pool alongside the other three, not carved out of them).
+- Row selection is recency-biased (--recent_bias, default 0.85): mysql_generator/ids.py's
+  IdTracker keeps a bounded in-memory deque of recent ids per table (thread-safe), primed
+  from existing data via ids.seed_from_table() before --simulate starts. pick_target_id()
+  samples from it most of the time, falling back to a uniform-random id-range query
+  otherwise — mimics real OLTP's skew toward recently-touched rows without extra query
+  load on the hot path.
+- --delete_mode hard|soft (default hard). Soft delete sets status='deleted'/deleted_at
+  instead of removing the row, and NEVER cascades (MySQL's ON DELETE CASCADE only fires
+  on an actual DELETE statement — there is no compensating application-level cascade for
+  soft deletes, by design).
+- --cascade_delete_ratio (default 10): percent of hard deletes that target accounts
+  instead of a single transaction row (workload.cascading_delete_account). Before issuing
+  the parent DELETE, this queries every transactions_{n} table for the account's current
+  child rows and logs that set as "expected_children" — MySQL's binlog only reflects the
+  client's DELETE FROM accounts statement explicitly; the cascaded child-row deletes are
+  only visible as row events at the storage-engine level (this cluster runs
+  binlog_row_image=FULL / ROW format specifically so those events exist at all), and
+  there's no way to ask MySQL afterward which children were removed.
+- transfer (workload.transfer): debits one account, credits another, inserts a ledger row
+  in each account's transactions_{n} table for that leg — all in one commit. This is what
+  makes the balance-conservation invariant checkable: sum(accounts.balance) should be
+  unchanged by any transfer, and Snowflake-side verification can recompute balances from
+  the transaction rows and compare.
+
+Ground-truth changelog (mysql_generator/changelog.py)
+- Local append-only JSONL file, NOT a database table — a table would itself flow through
+  the binlog as CDC noise that Artie/Openflow would need to be configured to exclude.
+  Each line is written only after its operation actually committed.
+- One line per committed operation for everything simulate mode does: insert, update,
+  delete, soft_delete, cascade_delete (includes account_balance + expected_children),
+  transfer (includes both ledger row ids + amount), ddl (includes the exact ALTER
+  statement).
+- Exception: the initial bulk-seed phase (--records_per_table, up to 10M rows) logs one
+  "bulk_insert_batch" entry per batch (count only), not per row — logging millions of
+  individual seed rows would defeat the point of batch inserts and bloat the file for a
+  phase that isn't part of the CDC-mechanics signal under test.
+- Accounts are the one exception to the bulk-vs-per-row split: seed_accounts logs one
+  "insert" entry per account (id + balance + owner_name), even though it's technically a
+  bulk-insert path, because --num_accounts is small (dozens/hundreds, not millions) and
+  the balance-conservation invariant can only be verified from the changelog alone (see
+  below) if each account's starting balance is actually in it.
+- read_entries(path) parses a changelog back into a list of dicts — used by tests and by
+  verify_snowflake.py.
+
+Verification tooling (snowflake_verify/, verify_snowflake.py)
+- Separate script/package from the MySQL generator, consistent with the vendor-separation
+  principle above — this one's Snowflake-side, not MySQL-side.
+- snowflake_verify/reconcile.py: pure logic, replays changelog entries into expected final
+  state ({accounts: {id: {balance, deleted}}, tables: {table: {id: {amount, status,
+  deleted}}}}) and diffs it against actual Snowflake rows. Fully unit-tested
+  (tests/test_snowflake_reconcile.py) without needing a live Snowflake connection.
+  Deliberately does NOT re-query MySQL — deleted rows can't be re-queried after the fact
+  anyway, so the changelog is the only consistent source of truth for inserts, updates,
+  and deletes alike (this was an explicit design decision, not an oversight).
+- snowflake_verify/snow_cli.py: shells out to `snow sql -c <connection> --format json`
+  rather than using snowflake-connector-python directly — this environment's Snowflake
+  connection ("snowflake-cli") uses EXTERNALBROWSER (interactive SSO) auth, which the
+  `snow` CLI already handles; a second Python-native driver would duplicate that auth
+  setup for no benefit. Mirrors the existing project convention (see sandbox
+  snowflake_dwh/DE-3834 scripts) for account-usage/cost queries.
+- IMPORTANT — the Snowflake database/schema/table names in verify_snowflake.py are
+  placeholders (--sf-database/--sf-schema are required CLI args, not defaulted) and
+  snow_cli.py assumes the landing table mirrors MySQL's column names (id, amount,
+  status, balance) exactly. Neither has been validated against real data: as of writing
+  this, the Openflow ingestion track for this PoC hadn't started yet (see HANDOFF.md) and
+  Artie was still being wired up via PrivateLink, so nothing has landed in Snowflake to
+  verify against. Fix snow_cli.py's column-name assumptions once the actual Openflow/
+  Artie landing schema is known — don't assume it matches without checking.
 
 CLI contracts
+- simulate_data_mysql.py and test_connection_mysql.py mirror the flag contracts below
+  exactly (same names, defaults, and semantics), with two differences: default --config
+  is still "python-datasource.json" but the default --alias is "MYSQLDS1" instead of
+  "PSQLDS1".
 - simulate_data.py flags:
   - --config: path to JSON config (default should be repo-root "python-datasource.json").
   - --alias: JSON alias (default "PSQLDS1").
@@ -69,20 +253,40 @@ CLI contracts
   - --num_workers: >1 enables concurrent insert path; else sequential.
   - --reset_all: drop and recreate all processed tables.
   - --reset_tables: comma-separated table numbers to reset (e.g., "1,3,5").
-- test_connection.py flags:
-  - --config, --alias (same semantics as above).
+- test_connection.py flags: --config, --alias (same semantics as above).
+- simulate_data_mysql.py additional/changed flags beyond the Postgres set:
+  - --num_accounts (default 100): rows to seed in the shared accounts table.
+  - --reset_all / --reset_tables now only drop+recreate the specified transactions_{n}
+    tables — accounts is left intact (it's shared infrastructure, not per-run disposable;
+    only --drop_database removes it).
+  - --drop_database: teardown — drops every table this tool owns (transactions_* and
+    accounts) via information_schema lookup, then exits. Does NOT issue DROP DATABASE
+    (avoids disturbing grants/config if the config alias ever points somewhere shared);
+    dropping every owned table is practically equivalent for this ephemeral PoC schema.
+  - --duration (seconds, optional): auto-stop --simulate after this long, for running
+    fixed-length comparable windows (needed to compare Artie vs Openflow cost/latency on
+    equivalent workloads — see below). Default: run until Ctrl+C, as before.
+  - --seed (int, optional): seeds Python's random module for reproducible runs — same
+    purpose as --duration, making two separate runs (e.g. one against Openflow today, one
+    against Artie later once it's live) statistically comparable in shape.
+  - --insert_ratio/--update_ratio/--delete_ratio/--transfer_ratio, --recent_bias,
+    --delete_mode, --cascade_delete_ratio, --ddl_interval_seconds, --ddl_ops, --changelog:
+    see "MySQL DML operation mix" and "MySQL DDL drift" above for semantics/defaults.
 
 Security and secrets
 - Do NOT commit real credentials. Treat example configs as placeholders; rotate if any real values were ever committed.
 - Prefer environment variables or secret managers for credentials. If JSON must be used locally, keep it out of version control and add to .gitignore.
-- Never interpolate untrusted inputs into SQL identifiers or queries. Table names here are generated (transactions_{n}); keep it that way.
+- Never interpolate untrusted inputs into SQL identifiers or queries. Table names here are generated (transactions_{n}, accounts); keep it that way. DDL drift generates its own column/index names (mysql_generator/schema.py's _random_suffix) rather than accepting external input.
 
 Style and code conventions
 - Python only; keep scripts simple and readable. Prefer functions with clear responsibilities and docstrings.
 - Naming: descriptive, full words (avoid abbreviations and 1–2 letter names).
 - Control flow: use guard clauses for validation; avoid deep nesting.
-- Error handling: catch exceptions where there is actionable remediation or user-facing messaging; otherwise let them propagate.
-- SQL: use execute_values for batch parameterization; avoid building VALUES tuples manually.
+- Error handling: catch exceptions where there is actionable remediation or user-facing messaging; otherwise let them propagate. Exception: simulate mode's DML/DDL loops catch
+  pymysql.err.MySQLError broadly and continue (see "Concurrency safety" above) — that's a
+  deliberate exception to "let it propagate," not a precedent for swallowing errors
+  elsewhere.
+- SQL: use execute_values (Postgres) / executemany (MySQL) for batch parameterization; avoid building VALUES tuples manually.
 - Logging: current scripts use print; keep consistency. If adding structured logging, do so across the codebase in one cohesive change.
 - Typing: new/modified functions should add type hints. Do not over-annotate trivial locals.
 - Formatting: multi-line over overly terse one-liners; wrap long lines; avoid unrelated reformatting.
@@ -91,12 +295,16 @@ Performance guidance
 - Favor batch_size around 10k unless memory/latency requirements dictate otherwise.
 - Set num_workers to a small integer relative to cores and database limits; pool size should match num_workers.
 - Keep commits per batch to balance durability and throughput. Avoid per-row commits.
+- MySQL --simulate mode operates on individual logical operations (one insert/update/
+  delete/transfer/DDL event) per tick, not big batches — this is deliberate, matching
+  "typical of a transactional system in production" rather than the Postgres bulk-batch
+  model. --delay applies per-tick, per worker.
 
 Path and consistency notes
 - Unify default config path across scripts to "python-datasource.json" at the repo root.
 - If changing defaults, update README and examples together.
 
-Runbook examples
+Runbook examples (Postgres)
 - Test connectivity:
   python3 test_connection.py --config python-datasource.json --alias PSQLDS1
 - Generate data sequentially (single table):
@@ -106,18 +314,83 @@ Runbook examples
 - Simulate continuous production:
   python3 simulate_data.py --config python-datasource.json --alias PSQLDS1 --num_tables 3 --records_per_table 1000 --simulate --batch_size 1000 --delay 1.5
 
+Runbook examples (MySQL, via cdcgen.py — preferred for day-to-day use)
+- Test connectivity: ./cdcgen.py check
+- Bulk-seed only: ./cdcgen.py seed --num-tables 1 --records-per-table 10000 --num-accounts 100
+- Full DDL+DML simulation, fixed 10-minute window, reproducible:
+  ./cdcgen.py simulate --num-tables 3 --records-per-table 10000 --num-accounts 200 \
+    --duration 600 --seed 42 --num-workers 4 --changelog run1_changelog.jsonl
+- Reset transactions tables (accounts left intact): ./cdcgen.py reset --num-tables 3
+- Teardown everything this tool owns: ./cdcgen.py teardown
+- Verify Snowflake state against a changelog (once the landing schema is known):
+  ./cdcgen.py verify --changelog run1_changelog.jsonl --sf-database CDC_POC --sf-schema PUBLIC --tables transactions_1,transactions_2,transactions_3
+- Run tests: ./cdcgen.py selftest (unit only) / ./cdcgen.py selftest --live (+ real cluster)
+- --config/--alias work before or after the subcommand; default to
+  python-datasource.json / CDC_POC_MYSQL, override either position if needed.
+
+Runbook examples (MySQL, underlying scripts directly — for flags cdcgen.py doesn't expose)
+- Test connectivity (also reports writer/reader role):
+  python3 test_connection_mysql.py --config python-datasource.json --alias MYSQLDS1
+- Bulk-seed only (accounts + transactions_1, no simulation):
+  python3 simulate_data_mysql.py --config python-datasource.json --alias MYSQLDS1 --num_tables 1 --records_per_table 10000 --num_accounts 100
+- Full DDL+DML simulation, fixed 10-minute window, reproducible:
+  python3 simulate_data_mysql.py --config python-datasource.json --alias MYSQLDS1 \
+    --num_tables 3 --records_per_table 10000 --num_accounts 200 \
+    --simulate --duration 600 --seed 42 --num_workers 4 \
+    --changelog run1_changelog.jsonl
+- Teardown everything this tool owns:
+  python3 simulate_data_mysql.py --config python-datasource.json --alias MYSQLDS1 --drop_database
+- Verify Snowflake state against a changelog (once the landing schema is known):
+  python3 verify_snowflake.py --changelog run1_changelog.jsonl --sf-database CDC_POC --sf-schema PUBLIC --tables transactions_1,transactions_2,transactions_3
+
 Testing and validation
-- After code changes, verify both:
-  - Connectivity: run test_connection.py.
-  - Insertions: run a small sequential insert and check row counts and schema.
+- Run the default suite (fast, no external deps): ./venv/bin/pytest — runs unit tests
+  only; tests/integration/ auto-skips without Docker (checked live: this dev laptop has
+  no Docker installed, so integration tests are written-but-unvalidated here — they run
+  wherever Docker is available, e.g. CI); tests/live_cluster/ is excluded by pytest.ini's
+  default addopts.
+- Run against the real PoC cluster explicitly: ./venv/bin/pytest -m live_cluster — skips
+  itself if python-datasource.json isn't present. This actually ran clean against the
+  live cdc-poc-artie2-aurora-mysql cluster during implementation (full lifecycle: schema
+  creation, seed, insert/update/soft-delete/transfer/DDL-drift, then cleans up its own
+  table).
+- After code changes to mysql_generator/, at minimum re-run the unit suite; for changes
+  touching schema.py/workload.py/concurrency.py, also do a short real --simulate run
+  (small --duration, small --ddl_interval_seconds) against the live cluster and inspect
+  the changelog — several real bugs (wrong Aurora read-only variable, TEXT column index
+  key-length, protected-columns gaps, exception type too narrow) were only caught this
+  way, not by unit tests.
+- For Postgres: run test_connection.py and a small sequential insert; check row counts
+  and schema.
 
 Non-goals
-- ORMs, migrations, and complex schema management are out of scope for this utility.
-- Multi-DB vendor support is not targeted.
+- ORMs, migrations-as-a-framework, and complex schema management are out of scope — the
+  DDL drift capability described above is a deliberately narrow, generator-controlled set
+  of ALTERs for CDC testing, not a general migration tool.
+- A unified multi-vendor CLI (single script branching on --db-type) is not targeted —
+  see "Vendor separation" above. Adding more dialects means adding more script pairs,
+  not branching existing ones.
+- Full type-aware adaptation to arbitrary DDL drift (e.g. an INSERT auto-adjusting its
+  value generation if MODIFY COLUMN changed a driftable column's type mid-run) is not
+  implemented — only column *existence* is re-introspected, not type. A type-changing
+  MODIFY on "description" can still cause an occasional insert/update to fail; this is
+  caught by the broad MySQLError handling (logged, skipped, doesn't crash) rather than
+  prevented. Treat this as acceptable graceful degradation, not a bug to silently fix by
+  over-protecting more columns.
+- Artie-vs-Openflow cost/performance measurement tooling (querying
+  WAREHOUSE_METERING_HISTORY / Snowpipe Streaming credits) is out of scope for this repo
+  — it's Snowflake-side analysis, not data generation, and belongs with the existing
+  sandbox cost-analysis scripts (see snowflake_dwh/DE-3834 for reusable query patterns).
+  This repo's job is producing the --seed/--duration-controlled comparable workload the
+  cost analysis would run against.
 
 Backlog candidates (if you extend the project)
-- Centralize config loading in a shared module; add .env support.
+- Mirror the MySQL DDL/DML simulation capability into simulate_data.py for Postgres, if a
+  future PoC needs it there too (explicitly out of scope for now — see Vendor separation).
+- Confirm the real Openflow/Artie Snowflake landing schema and fix snowflake_verify/
+  snow_cli.py's column-name assumptions accordingly; currently unvalidated against live
+  data since neither ingestion pipeline had landed anything as of implementation.
+- Type-aware DDL-drift-safe value generation (see Non-goals) if the current
+  graceful-degradation behavior proves too noisy in practice.
+- Centralize config loading further / add .env support.
 - Replace print with logging and configurable log levels.
-- Add CLI validation error messages with helpful remediation hints.
-- Add type hints across the codebase and basic unit tests for parse_jdbc_url and config loading.
-- Support custom schemas/columns via templated generators.
