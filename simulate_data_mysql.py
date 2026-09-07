@@ -45,15 +45,32 @@ def insert_seed_records_concurrent(db_params, table_name, num_records, account_i
 
     pool = SimpleConnectionPool(db_params, num_workers)
 
-    def work(batch):
+    def work(batch, max_attempts=3):
         conn = pool.getconn()
-        try:
-            workload.bulk_insert_batch(conn, table_name, batch, changelog)
-        except Exception as e:
-            print(f"Error inserting batch for {table_name}: {e}")
-            conn.rollback()
-        finally:
-            pool.putconn(conn)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                workload.bulk_insert_batch(conn, table_name, batch, changelog)
+                break
+            except Exception as e:
+                print(f"Error inserting batch for {table_name} (attempt {attempt}/{max_attempts}): {e}")
+                # The connection may be dead (e.g. a silently-dropped socket)
+                # rather than just having a rolled-back transaction, so replace
+                # it instead of reusing it for the retry.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = pymysql.connect(**db_params)
+                if attempt == max_attempts:
+                    print(f"Giving up on batch for {table_name} after {max_attempts} attempts; {len(batch)} rows lost.")
+        pool.putconn(conn)
+        if progress:
+            # Advance only once the batch is actually done (success or given
+            # up), not when it's merely submitted — otherwise the bar hits
+            # 100% as soon as everything is queued, long before the work
+            # (which can take much longer under real network conditions) is
+            # actually finished.
+            progress.update(1)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
@@ -63,8 +80,6 @@ def insert_seed_records_concurrent(db_params, table_name, num_records, account_i
             batch = workload.generate_seed_batch(this_batch, account_ids)
             futures.append(executor.submit(work, batch))
             remaining -= this_batch
-            if progress:
-                progress.update(1)
         for future in concurrent.futures.as_completed(futures):
             future.result()
     if progress:
@@ -98,7 +113,11 @@ def _dml_tick(conn, table_names, trackers, account_tracker, changelog, args):
             table_name = random.choice(table_names)
             workload.update_transaction(conn, table_name, trackers[table_name], changelog, recent_bias=args.recent_bias)
         elif op == "delete":
-            if args.delete_mode == "hard" and random.uniform(0, 100) < args.cascade_delete_ratio:
+            if (
+                args.delete_mode == "hard"
+                and random.uniform(0, 100) < args.cascade_delete_ratio
+                and len(account_tracker) > args.min_accounts
+            ):
                 workload.cascading_delete_account(conn, table_names, trackers, account_tracker, changelog)
             else:
                 table_name = random.choice(table_names)
@@ -239,6 +258,10 @@ def main():
     parser.add_argument("--cascade_delete_ratio", type=float, default=10,
                         help="Percent of hard deletes that are account-level cascading deletes instead of a "
                              "single transaction row.")
+    parser.add_argument("--min_accounts", type=int, default=10,
+                        help="Floor on live accounts: cascade-delete falls back to a normal transaction-row "
+                             "delete once the account count would drop to or below this, so a long-running "
+                             "simulate (with no account-creation op) can't exhaust the account pool entirely.")
 
     parser.add_argument("--ddl_interval_seconds", type=float, default=300,
                         help="Approximate seconds between DDL drift events, per table (jittered 0.5x-1.5x).")
@@ -246,6 +269,11 @@ def main():
                         help=f"Comma-separated subset of DDL drift ops to enable (default: all of {DDL_OP_NAMES}).")
     parser.add_argument("--changelog", type=str, default="generator_changelog.jsonl",
                         help="Path to the ground-truth JSONL changelog.")
+    parser.add_argument("--skip_seed", action="store_true",
+                        help="Skip the transactions_{n} bulk-insert step (customers/accounts top-up still runs, "
+                             "since that's already a safe no-op when enough rows exist). Use this to run DML-only "
+                             "against data that's already on the cluster, without adding another --records_per_table "
+                             "batch on top of it.")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -317,15 +345,18 @@ def main():
             print(f"Creating table (if not exists): {table_name}")
         schema.create_transactions_table(conn, table_name)
 
-        print(f"Seeding {args.records_per_table} records into {table_name}.")
-        if args.num_workers > 1:
-            insert_seed_records_concurrent(
-                db_params, table_name, args.records_per_table, account_ids,
-                batch_size=args.batch_size, num_workers=args.num_workers, changelog=changelog,
-            )
+        if args.skip_seed:
+            print(f"Skipping bulk-seed for {table_name} (--skip_seed).")
         else:
-            insert_seed_records(conn, table_name, args.records_per_table, account_ids,
-                                 batch_size=args.batch_size, changelog=changelog)
+            print(f"Seeding {args.records_per_table} records into {table_name}.")
+            if args.num_workers > 1:
+                insert_seed_records_concurrent(
+                    db_params, table_name, args.records_per_table, account_ids,
+                    batch_size=args.batch_size, num_workers=args.num_workers, changelog=changelog,
+                )
+            else:
+                insert_seed_records(conn, table_name, args.records_per_table, account_ids,
+                                     batch_size=args.batch_size, changelog=changelog)
 
     if args.simulate:
         run_simulation(db_params, table_names, changelog, args)

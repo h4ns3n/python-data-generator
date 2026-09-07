@@ -1,3 +1,5 @@
+import datetime
+import json
 import random
 import string
 
@@ -32,6 +34,87 @@ def bulk_insert_batch(conn, table_name, batch, changelog=None):
     conn.commit()
     if changelog:
         changelog.write("bulk_insert_batch", table_name, count=len(batch))
+
+
+_LARGE_TEXT_ALPHABET = string.ascii_letters + string.digits + "        "
+
+
+def _random_large_text(length=16000):
+    return "".join(random.choices(_LARGE_TEXT_ALPHABET, k=length))
+
+
+def _sample_json_payload(min_bytes=5 * 1024, max_bytes=10 * 1024):
+    """
+    A nested JSON structure padded with synthetic line items until it lands
+    in the 5-10KB range, then serialized to bytes for a BLOB column — a
+    stand-in for the kind of large opaque payload a real fintech transaction
+    log might carry (receipt detail, provider response, audit trail).
+    """
+    target_bytes = random.randint(min_bytes, max_bytes)
+    line_items = []
+    payload = {
+        "transaction_ref": f"TXN-{random.randint(10 ** 9, 10 ** 10 - 1)}",
+        "processed_by": "cdc-poc-generator",
+        "line_items": line_items,
+    }
+    while len(json.dumps(payload).encode("utf-8")) < target_bytes:
+        line_items.append({
+            "sku": f"SKU-{random.randint(1000, 9999)}",
+            "description": _random_description(20),
+            "qty": random.randint(1, 20),
+            "unit_price": round(random.uniform(1, 500), 2),
+            "metadata": {"warehouse": random.choice(["A", "B", "C"]), "batch": random.randint(1, 999)},
+        })
+    return json.dumps(payload).encode("utf-8")
+
+
+def _random_settlement_date():
+    return datetime.date.today() - datetime.timedelta(days=random.randint(0, 365))
+
+
+def _random_processed_at():
+    return datetime.datetime.now() - datetime.timedelta(
+        days=random.randint(0, 30), seconds=random.randint(0, 86400)
+    )
+
+
+def generate_seed_batch_wide(batch_size, account_ids):
+    return [
+        (
+            random.choice(account_ids),
+            random.choice(schema.TRANSACTION_TYPES),
+            _random_amount(),
+            random.choice(schema.CURRENCIES),
+            random.choice([0, 1]),
+            random.randint(0, 1000),
+            random.randint(0, 2_000_000_000),
+            random.randint(0, 2 ** 63 - 1),
+            round(random.uniform(0.5, 2.0), 6),
+            round(random.uniform(0, 1_000_000), 4),
+            _random_settlement_date(),
+            _random_processed_at(),
+            random.choice(schema.WIDE_CHANNELS),
+            json.dumps({"source": "generator", "note": _random_description(20)}),
+            _random_large_text(),
+            _sample_json_payload(),
+        )
+        for _ in range(batch_size)
+    ]
+
+
+def bulk_insert_wide_batch(conn, batch, changelog=None):
+    insert_sql = (
+        f"INSERT INTO {schema.WIDE_TRANSACTIONS_TABLE} "
+        "(account_id, transaction_type, amount, currency, is_flagged, risk_score, "
+        "sequence_no, external_ref, exchange_rate, precise_amount, settlement_date, "
+        "processed_at, channel, metadata, large_note, payload_blob) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    with conn.cursor() as cur:
+        cur.executemany(insert_sql, batch)
+    conn.commit()
+    if changelog:
+        changelog.write("bulk_insert_batch", schema.WIDE_TRANSACTIONS_TABLE, count=len(batch))
 
 
 def _has_description(conn, table_name):

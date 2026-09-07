@@ -41,6 +41,9 @@ def test_load_db_config_with_ssl(tmp_path):
         "user": "user1",
         "password": "pass1",
         "ssl": {},
+        "connect_timeout": 10,
+        "read_timeout": 90,
+        "write_timeout": 90,
     }
 
 

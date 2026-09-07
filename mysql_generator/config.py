@@ -42,6 +42,18 @@ def load_db_config(config_file, alias):
     db_params = parse_jdbc_url(conn_info["url"])
     db_params["user"] = conn_info.get("username", "")
     db_params["password"] = conn_info.get("password", "")
+    # Without these, a silently-dropped connection (e.g. a mid-connection TCP
+    # drop on a path that isn't a normal corporate-network route, like this
+    # cluster's /etc/hosts-routed private RDS endpoint) blocks the calling
+    # thread forever instead of raising, since pymysql has no default socket
+    # timeout. read/write default to 90s rather than a tighter value because
+    # this connection path is measurably high-latency/bandwidth-constrained
+    # (~1.1-1.2MB/s aggregate observed), and a large batch (e.g. the wide
+    # table's ~20-26KB rows under concurrent load) can legitimately take
+    # 30-50s+ without anything being wrong.
+    db_params["connect_timeout"] = conn_info.get("connect_timeout", 10)
+    db_params["read_timeout"] = conn_info.get("read_timeout", 90)
+    db_params["write_timeout"] = conn_info.get("write_timeout", 90)
     if conn_info.get("ssl"):
         # PyMySQL treats a dict here as ssl.wrap_socket()-style kwargs (ca, cert,
         # key, ...); an empty dict enables TLS with the default context, mirroring

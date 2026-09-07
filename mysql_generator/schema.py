@@ -105,6 +105,60 @@ def create_transactions_table(conn, table_name):
     conn.commit()
 
 
+WIDE_TRANSACTIONS_TABLE = "transactions_4"
+WIDE_CHANNELS = ["web", "mobile", "api", "batch", "branch"]
+
+
+def create_wide_transactions_table(conn):
+    """
+    Standalone wide table for testing CDC handling of large/varied payloads:
+    a spread of numeric/date/enum/JSON types plus a near-max-size VARCHAR and
+    a BLOB carrying a 5-10KB sample JSON structure. Deliberately NOT part of
+    the transactions_{n} family driven by --num-tables / DDL drift / the
+    simulate DML loop, since those assume the narrower 3-table schema and
+    have no columns to populate this one's large fields with. Insert-only
+    population (seed_wide_table.py), no update/delete/DDL-drift support.
+
+    account_id FK cascades on account delete like the other transactions_{n}
+    tables, so a cascade-delete elsewhere in the schema will also remove rows
+    here at the database level — but the generic cascading_delete_account()
+    ground-truth changelog entry only covers tables it's told about (the
+    standard 3), so a cascade delete would silently drop rows here without a
+    matching changelog record. Not a concern while this table is insert-only.
+    """
+    sql = f"""
+    CREATE TABLE IF NOT EXISTS {WIDE_TRANSACTIONS_TABLE} (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        account_id BIGINT NOT NULL,
+        transaction_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        transaction_type VARCHAR(20) NOT NULL,
+        amount DECIMAL(14,2) NOT NULL,
+        currency CHAR(3) NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'active',
+        deleted_at DATETIME NULL,
+
+        is_flagged TINYINT(1) NOT NULL DEFAULT 0,
+        risk_score SMALLINT NOT NULL,
+        sequence_no INT NOT NULL,
+        external_ref BIGINT UNSIGNED NOT NULL,
+        exchange_rate FLOAT NOT NULL,
+        precise_amount DOUBLE NOT NULL,
+        settlement_date DATE NOT NULL,
+        processed_at TIMESTAMP NULL,
+        channel ENUM('web','mobile','api','batch','branch') NOT NULL,
+        metadata JSON NOT NULL,
+
+        large_note VARCHAR(16000) CHARACTER SET utf8mb4 NOT NULL,
+        payload_blob BLOB NOT NULL,
+
+        FOREIGN KEY (account_id) REFERENCES {ACCOUNTS_TABLE}(id) ON DELETE CASCADE
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+
 def drop_transactions_table(conn, table_name):
     with conn.cursor() as cur:
         cur.execute(f"DROP TABLE IF EXISTS {table_name};")

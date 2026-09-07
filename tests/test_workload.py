@@ -14,6 +14,45 @@ def test_generate_seed_batch_shape():
         assert currency in schema.CURRENCIES
 
 
+def test_sample_json_payload_within_target_range():
+    for _ in range(20):
+        payload = workload._sample_json_payload()
+        assert isinstance(payload, bytes)
+        assert 5 * 1024 <= len(payload) <= 10 * 1024 + 512  # last line item can push slightly past the target
+
+
+def test_random_large_text_default_length():
+    text = workload._random_large_text()
+    assert len(text) == 16000
+
+
+def test_generate_seed_batch_wide_shape():
+    batch = workload.generate_seed_batch_wide(5, account_ids=[10, 20])
+    assert len(batch) == 5
+    for row in batch:
+        (account_id, transaction_type, amount, currency, is_flagged, risk_score, sequence_no,
+         external_ref, exchange_rate, precise_amount, settlement_date, processed_at,
+         channel, metadata, large_note, payload_blob) = row
+        assert account_id in [10, 20]
+        assert transaction_type in schema.TRANSACTION_TYPES
+        assert currency in schema.CURRENCIES
+        assert is_flagged in (0, 1)
+        assert channel in schema.WIDE_CHANNELS
+        assert len(large_note) == 16000
+        assert 5 * 1024 <= len(payload_blob) <= 10 * 1024 + 512
+
+
+def test_bulk_insert_wide_batch_executes_and_commits():
+    cursor = FakeCursor()
+    conn = FakeConn(cursor)
+    changelog = FakeChangelog()
+    batch = workload.generate_seed_batch_wide(3, account_ids=[1])
+    workload.bulk_insert_wide_batch(conn, batch, changelog)
+    assert conn.committed is True
+    assert changelog.entries[-1]["op"] == "bulk_insert_batch"
+    assert changelog.entries[-1]["table"] == schema.WIDE_TRANSACTIONS_TABLE
+
+
 def test_insert_transaction_includes_description_when_column_present():
     # get_columns query result includes "description"
     cursor = FakeCursor(fetchall_return=[("id",), ("amount",), ("description",), ("account_id",)], lastrowid=7)

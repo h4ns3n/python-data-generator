@@ -88,10 +88,12 @@ def cmd_simulate(args):
         "recent_bias": "--recent_bias",
         "delete_mode": "--delete_mode",
         "cascade_delete_ratio": "--cascade_delete_ratio",
+        "min_accounts": "--min_accounts",
         "ddl_interval_seconds": "--ddl_interval_seconds",
         "ddl_ops": "--ddl_ops",
         "changelog": "--changelog",
         "reset_all": "--reset_all",
+        "skip_seed": "--skip_seed",
     }
     cmd = [PYTHON, "simulate_data_mysql.py", "--config", args.config, "--alias", args.alias, "--simulate"]
     cmd += _forward(args, mapping)
@@ -111,6 +113,18 @@ def cmd_reset(args):
 
 def cmd_teardown(args):
     _run([PYTHON, "simulate_data_mysql.py", "--config", args.config, "--alias", args.alias, "--drop_database"])
+
+
+def cmd_seed_wide(args):
+    mapping = {
+        "records": "--records",
+        "batch_size": "--batch-size",
+        "num_workers": "--num-workers",
+        "changelog": "--changelog",
+    }
+    cmd = [PYTHON, "seed_wide_table.py", "--config", args.config, "--alias", args.alias]
+    cmd += _forward(args, mapping)
+    _run(cmd)
 
 
 def cmd_verify(args):
@@ -181,10 +195,13 @@ def build_parser():
     p.add_argument("--recent-bias", type=float, default=None, dest="recent_bias")
     p.add_argument("--delete-mode", choices=["hard", "soft"], default=None, dest="delete_mode")
     p.add_argument("--cascade-delete-ratio", type=float, default=None, dest="cascade_delete_ratio")
+    p.add_argument("--min-accounts", type=int, default=None, dest="min_accounts")
     p.add_argument("--ddl-interval-seconds", type=float, default=None, dest="ddl_interval_seconds")
     p.add_argument("--ddl-ops", default=None, dest="ddl_ops")
     p.add_argument("--changelog", default="generator_changelog.jsonl")
     p.add_argument("--reset-all", action="store_true", dest="reset_all")
+    p.add_argument("--skip-seed", action="store_true", dest="skip_seed",
+                    help="Skip the transactions_{n} bulk-insert step; run DML only against rows already on the cluster.")
     p.set_defaults(func=cmd_simulate)
 
     p = subparsers.add_parser("reset", help="Drop and recreate transactions_{n} tables (accounts left intact).", parents=[common])
@@ -195,6 +212,17 @@ def build_parser():
 
     p = subparsers.add_parser("teardown", help="Drop every table this tool owns (accounts + all transactions_*).", parents=[common])
     p.set_defaults(func=cmd_teardown)
+
+    p = subparsers.add_parser(
+        "seed-wide",
+        help="Insert-only bulk population of the wide transactions_4 table (large VARCHAR/BLOB/JSON).",
+        parents=[common],
+    )
+    p.add_argument("--records", type=int, default=None, help="Rows to insert this run (underlying default: 1,000,000).")
+    p.add_argument("--batch-size", type=int, default=None, dest="batch_size")
+    p.add_argument("--num-workers", type=int, default=None, dest="num_workers")
+    p.add_argument("--changelog", default=None)
+    p.set_defaults(func=cmd_seed_wide)
 
     p = subparsers.add_parser("verify", help="Compare Snowflake state against a changelog.")
     p.add_argument("--changelog", required=True)
